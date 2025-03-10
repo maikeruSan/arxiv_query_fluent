@@ -290,7 +290,6 @@ The following example demonstrates how to iterate through paginated results usin
 
 ```python
 q = Query(max_entries_per_pager=10).add(Field.title, "transformer").add(Field.submitted_date, DateRange("20230101", "20230110"), Opt.And)
-total = 0
 for page in q.paginated_results():
     page.desc()
 ```
