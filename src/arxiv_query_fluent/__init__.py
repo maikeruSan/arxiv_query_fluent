@@ -1,8 +1,11 @@
 import feedparser
 import urllib.request
-import re
+import urllib.parse
+import http.client
+import time
+from datetime import datetime
 from arxiv import SortCriterion, SortOrder, Result
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Generator
 from enum import Enum
 import logging
 from dataclasses import dataclass
@@ -11,7 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 class Category(Enum):
-    # --- Computer Science ---
+    """
+    Enumeration of valid arXiv categories.
+
+    Categories include subjects from Computer Science, Economics, Electrical Engineering, Mathematics,
+    Physics, Quantitative Biology, Quantitative Finance, and Statistics.
+    """
+
     CS_AI = "cs.AI"
     CS_AR = "cs.AR"
     CS_CC = "cs.CC"
@@ -209,7 +218,11 @@ class Category(Enum):
 
 
 class Field(Enum):
-    """Enum for arXiv query fields."""
+    """
+    Enumeration of arXiv query fields.
+
+    These fields represent the searchable components of an arXiv entry.
+    """
 
     title = "ti"
     author = "au"
@@ -219,11 +232,14 @@ class Field(Enum):
     category = "cat"
     all = "all"
     id = "id"
-    sumbitted_date = "submittedDate"
+    submitted_date = "submittedDate"
+    rn = "rn"
 
 
 class Opt(Enum):
-    """Enum for Boolean operators."""
+    """
+    Enumeration of Boolean operators for combining query conditions.
+    """
 
     And = "AND"
     Or = "OR"
@@ -231,29 +247,56 @@ class Opt(Enum):
 
 
 class InvalidDateFormatError(Exception):
-    """Custom exception for invalid submittedDate format."""
+    """
+    Exception raised when a date string does not conform to the expected format.
+
+    Expected formats are YYYYMMDD or YYYYMMDDTTTT.
+    """
 
     pass
 
 
 class InvalidCategoryError(Exception):
-    """Custom exception for invalid category selection."""
+    """
+    Exception raised when an invalid category value is provided.
+
+    The category must be one of the predefined Category enum values or a matching string.
+    """
+
+    pass
+
+
+class PrependOperatorError(Exception):
+    """
+    Exception raised when a Boolean operator is required but missing or of incorrect type.
+    """
 
     pass
 
 
 class DateRange:
-    """Class for handling date ranges in arXiv API queries."""
+    """
+    Class for representing and validating a date range for arXiv API queries.
+
+    Dates should be provided in YYYYMMDD or YYYYMMDDTTTT format. If the time component is missing,
+    it is automatically appended (0000 for start dates and 2359 for end dates).
+
+    Example:
+        >>> dr = DateRange("20240101", "20241231")
+        >>> print(dr)
+        [202401010000 TO 202412312359]
+    """
 
     def __init__(self, start: str, end: str):
-        """Initialize a date range with start and end dates.
+        """
+        Initialize a DateRange with the specified start and end dates.
 
         Args:
-            start (str): Start date in YYYYMMDD or YYYYMMDDTTTT format
-            end (str): End date in YYYYMMDD or YYYYMMDDTTTT format
+            start (str): Start date in YYYYMMDD or YYYYMMDDTTTT format.
+            end (str): End date in YYYYMMDD or YYYYMMDDTTTT format.
 
         Raises:
-            ValueError: If dates are invalid or start date is after end date
+            ValueError: If either date format is invalid or if the start date is later than the end date.
         """
         self._validate_date_format(start, "start")
         self._validate_date_format(end, "end")
@@ -264,86 +307,299 @@ class DateRange:
 
         # Validate chronological order
         if int(self.start) > int(self.end):
-            raise ValueError(f"Start date ({start}) must be earlier than or equal to end date ({end})")
+            raise InvalidDateFormatError(f"Start date ({start}) must be earlier than or equal to end date ({end})")
 
     @staticmethod
     def _validate_date_format(date: str, date_type: str) -> None:
-        """Validate the date format.
+        """
+        Validate the date format.
 
         Args:
-            date (str): Date string to validate
-            date_type (str): Type of date ('start' or 'end') for error messages
+            date (str): The date string to validate.
+            date_type (str): Indicates whether this is the 'start' or 'end' date for error messages.
 
         Raises:
-            ValueError: If date format is invalid
+            ValueError: If the date format does not match YYYYMMDD or YYYYMMDDTTTT.
         """
-        if not re.match(r"^\d{8}(\d{4})?$", date):
-            raise ValueError(f"Invalid {date_type} date format: {date}. " "Expected format: YYYYMMDD or YYYYMMDDTTTT")
+        if len(date) == 8:
+            date_format = "%Y%m%d"
+        elif len(date) == 12:
+            date_format = "%Y%m%d%H%M"
+        else:
+            raise InvalidDateFormatError(f"Invalid {date_type} date format: {date}. Expected format: YYYYMMDD or YYYYMMDDHHMM")
+
+        try:
+            datetime.strptime(date, date_format)
+        except ValueError as e:
+            raise InvalidDateFormatError(f"Invalid {date_type} date: {date} is not a valid date") from e
 
     @staticmethod
     def _normalize_date(date: str, is_start: bool) -> str:
-        """Normalize date by adding time if needed.
+        """
+        Normalize a date string by appending a time component if missing.
 
         Args:
-            date (str): Date string to normalize
-            is_start (bool): True if this is a start date, False if end date
+            date (str): The date string to normalize.
+            is_start (bool): True if this is a start date (append '0000'); False if an end date (append '2359').
 
         Returns:
-            str: Normalized date in YYYYMMDDTTTT format
+            str: The normalized date string in YYYYMMDDTTTT format.
         """
         if len(date) == 8:  # YYYYMMDD format
             return date + ("0000" if is_start else "2359")
         return date  # Already in YYYYMMDDTTTT format
 
     def __str__(self) -> str:
-        """Convert date range to arXiv API query format.
+        """
+        Convert the DateRange to a string formatted for arXiv API queries.
 
         Returns:
-            str: Date range in format [YYYYMMDDTTTT TO YYYYMMDDTTTT]
+            str: The date range in the format "[YYYYMMDDTTTT TO YYYYMMDDTTTT]".
         """
         return f"[{self.start} TO {self.end}]"
 
 
+class Entry(Result):
+    """
+    A wrapper subclass of the Result class from arxiv.py.
+
+    This class is intended to extend or customize the functionality of the
+    original Result class. For more details on the base implementation, please refer to:
+    https://github.com/lukasschwab/arxiv.py/blob/master/arxiv/__init__.py
+    """
+
+    pass
+
+
 @dataclass
 class FeedResults:
-    entrys: List[Result]
-    totalResults: int
+    """
+    Data class that encapsulates the results returned from an arXiv API query.
+
+    This class holds the list of individual arXiv query result entries along with associated pagination details.
+
+    Attributes:
+        entrys (List[Entry]): A list of arXiv query result entries.
+        total_entries_of_query (int): The total number of entries available for the query.
+        startIndex (int): The index of the first result in the current page (0-based).
+        maxEntryPerPage (int): The maximum number of entries per page as specified in the query.
+    """
+
+    entrys: List[Entry]
+    total_entries_of_query: int
     startIndex: int
-    itemsPerPage: int
+    maxEntryPerPage: int
+
+    def download_pdf(self, identifier: str, dirpath: str, filename: Optional[str] = None) -> Optional[str]:
+        """
+        Download the PDF file for a specific arXiv entry identified by its short identifier.
+
+        This method iterates through the list of entries and checks if the short identifier of an entry
+        matches the provided Identifier. When a match is found, it attempts to download the PDF file for that entry.
+        The downloaded PDF will be saved in the specified directory with either a custom filename (if provided)
+        or a default filename derived from the arXiv identifier.
+
+        Args:
+            Identifier (str): The short arXiv identifier for the entry (as returned by get_short_id()).
+            dirpath (str): The directory path where the PDF should be saved.
+            filename (Optional[str]): A custom filename for the saved PDF. If not provided, the identifier is used
+                                      to generate a filename in the format '<Identifier>.pdf'.
+
+        Returns:
+            Optional[str]: The file path of the downloaded PDF if successful; otherwise, None.
+        """
+        # Iterate over all entries to find the one matching the provided identifier.
+        for entry in self.entrys:
+            # Check if the entry's short identifier matches the provided Identifier.
+            if entry.get_short_id() == identifier:
+                # Determine the filename: use the provided filename if available,
+                # otherwise, default to '<Identifier>.pdf'.
+                fn = filename if filename is not None else f"{identifier}.pdf"
+                # Attempt to download the PDF file and return the resulting file path.
+                return entry.download_pdf(dirpath, fn)
+
+        # If no matching entry is found, return None.
+        return f"Identifier:{identifier} no found in the current entries"
+
+    def current_page(self) -> int:
+        return self.startIndex // self.maxEntryPerPage + 1
+
+    def total_page_of_query(self) -> int:
+        return (self.total_entries_of_query + self.maxEntryPerPage - 1) // self.maxEntryPerPage
+
+    def show(self, top_n: Optional[int] = None, abstract_shown: int = 200) -> None:
+        """
+        Display detailed information of the arXiv query results on the console.
+
+        This method prints the results in a formatted manner including pagination info,
+        entry index, title, arXiv identifier, authors, publication date, PDF link, and
+        a truncated abstract.
+
+        Args:
+            top_n (Optional[int]): The maximum number of entries to display. If None, all entries are displayed.
+                                   If top_n is 0, nothing is displayed.
+            abstract_shown (int): The maximum number of characters to show for each abstract.
+                                  If the abstract length exceeds this number, it is truncated with '...'.
+        """
+        # If top_n is 0, do not display any entries.
+        if top_n == 0:
+            return None
+        # If size of entrys is zero ..
+        if len(self.entrys) == 0:
+            print("The entries(results) is empty")
+            return None
+
+        # Determine the number of entries to display.
+        show_n = min(top_n, len(self.entrys)) if top_n is not None else len(self.entrys)
+
+        # Calculate the starting and ending indices for the current page display.
+        e_start = self.startIndex + 1
+        e_end = self.startIndex + show_n
+
+        # Calculate the total number of entries available on this page.
+        last_page_n = self.startIndex + len(self.entrys)
+
+        # Print pagination and entry range information.
+        print(f"Entries: {e_start}-{e_end}/({last_page_n}) | Pages: {self.current_page()} / {self.total_page_of_query()}")
+        print("───────────────────────────────────────────")
+
+        # Iterate over each entry and display detailed information.
+        for i, entry in enumerate(self.entrys, 1):
+            # Retrieve PDF link if available.
+            pdf_link = next((str(l.href) for l in entry.links if l.title == "pdf"), None)
+            if pdf_link is None:
+                logger.warning(f"No PDF link found for entry {i}: {entry.title}")
+
+            # Display entry information.
+            print(f"Entry: #{self.startIndex + i}")
+            print(f"Title: {entry.title} | arXiv Identifier: {entry.get_short_id()}")
+            print(f"Authors: {', '.join(a.name for a in entry.authors)}")
+            print(f"Published Date: {entry.published}")
+            print(f"PDF Link: {pdf_link if pdf_link else 'No PDF link available.'}")
+
+            # Display truncated abstract if applicable.
+            if abstract_shown > 0:
+                print(f"Abstract:\n{entry.summary[:abstract_shown]}{'...' if len(entry.summary) > abstract_shown else ''}")
+
+            print("───────────────────────────────────────────")
+
+            # Stop after displaying top_n entries if top_n is specified.
+            if top_n is not None and i >= top_n:
+                break
+
+    def __len__(self) -> int:
+        return len(self.entrys)
 
     def __str__(self) -> str:
-        tostr: str = ""
-        for entry in self.entrys:
-            tostr = tostr + (f"[{entry.published}]:[{entry.title}]:[{','.join([a.name for a in entry.authors])}]") + "\n"
+        return f"Page Entries: {self.startIndex+1}-{self.startIndex+len(self.entrys)} | Total Entries : {self.total_entries_of_query} | Pages: {self.current_page()} / {self.total_page_of_query()}"
 
-        return tostr
+    def desc(self) -> None:
+        print(self.__str__())
+
+    def get_list(self) -> str:
+        """
+        Generate and return a formatted string representing the arXiv feed results.
+
+        For each entry in the feed, this method extracts:
+          - The publication date, formatted as 'YYYY-MM-DD'. If the publication date is a datetime object,
+            it is directly formatted. If it is a string, an attempt is made to parse it using datetime.fromisoformat;
+            if parsing fails, the original value is used.
+          - The title of the entry.
+          - The authors of the entry, concatenated with commas.
+
+        Each entry is represented on a separate line in the following format:
+            [YYYY-MM-DD] [Title] [Author1, Author2, ...]
+
+        Returns:
+            str: A formatted string containing all entries from the feed.
+        """
+        result_str = ""
+        for entry in self.entrys:
+            # Determine the publication date:
+            # - If entry.published is a datetime object, format it directly.
+            # - Otherwise, try to parse it with fromisoformat; if that fails, use the original value.
+            if isinstance(entry.published, datetime):
+                published_date = entry.published.strftime("%Y-%m-%d")
+            else:
+                try:
+                    dt = datetime.fromisoformat(entry.published)
+                    published_date = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    published_date = entry.published
+            # Append the formatted entry information to the result string.
+            result_str += f"[{published_date}] [{entry.title}] [{','.join(a.name for a in entry.authors)}]\n"
+        return result_str
+
+    def list(self) -> None:
+        print(self.get_list())
 
 
 class Query:
-    """Builder class for constructing arXiv API query strings."""
+    """
+    Builder class for constructing and executing arXiv API queries.
+
+    This class provides methods to add individual query conditions or grouped conditions,
+    build the complete query string, and execute the query to retrieve paginated results.
+    """
 
     def __init__(
         self,
         base_url: str = "http://export.arxiv.org/api/query?",
-        max_results_per_paer: int = 10,
-        sortBy: SortOrder = SortCriterion.SubmittedDate,
+        max_entries_per_pager: int = 50,
+        sortBy: SortCriterion = SortCriterion.SubmittedDate,
         sortOrder: SortOrder = SortOrder.Descending,
     ):
-        self.max_results = max_results_per_paer
+        """
+        Initialize a Query instance with configuration for the arXiv API.
+
+        Args:
+            base_url (str): The base URL for the arXiv API.
+            max_entries_per_pager (int): Maximum number of (entries)results to return per page.
+            sortBy (SortCriterion): The field by which to sort the results.
+            sortOrder (SortOrder): The order in which to sort the results.
+        """
+        self.max_results = max_entries_per_pager
         self.sortBy = sortBy
         self.sortOrder = sortOrder
         self.queries: List[str] = []
         self.base_url = base_url
 
-    def add_group(self, arxiv_query: "Query", boolean_operator: Optional[Opt] = None) -> "Query":
-        query: str = f"({arxiv_query.search_query()})"
-        if len(self.queries) > 0:
-            if boolean_operator is None:
-                raise ValueError("Boolean operator is required when adding multiple queries")
-            if not isinstance(boolean_operator, Opt):
-                raise ValueError(f"Boolean operator must be a BooleanOperator enum, got {type(boolean_operator)}")
-            query = f"{boolean_operator.value} {query}"
+    def _prepend_boolean_operator(self, query: str, boolean_operator: Optional[Opt]) -> str:
+        """
+        Prepend a Boolean operator to a query fragment if the query already contains conditions.
 
+        Args:
+            query (str): The query fragment to which the Boolean operator may be prepended.
+            boolean_operator (Optional[Opt]): The Boolean operator to use; must be provided if there are existing conditions.
+
+        Returns:
+            str: The query fragment with the Boolean operator prepended if required.
+
+        Raises:
+            PrependOperatorError: If a Boolean operator is required but not provided or of an incorrect type.
+        """
+        if self.queries:
+            if boolean_operator is None:
+                raise PrependOperatorError("Boolean operator is required when adding multiple queries")
+            if not isinstance(boolean_operator, Opt):
+                raise PrependOperatorError(f"Boolean operator must be a BooleanOperator enum, got {type(boolean_operator)}")
+            return f"{boolean_operator.value} {query}"
+        return query
+
+    def add_group(self, arxiv_query: "Query", boolean_operator: Optional[Opt] = None) -> "Query":
+        """
+        Add a grouped query by wrapping another Query's search query in parentheses.
+
+        Args:
+            arxiv_query (Query): A Query instance whose search_query() returns a query fragment.
+            boolean_operator (Optional[Opt]): The Boolean operator to combine this group with existing queries.
+                                              Required if there are existing queries.
+
+        Returns:
+            Query: Self for method chaining.
+        """
+        query = f"({arxiv_query.search_query()})"
+        query = self._prepend_boolean_operator(query, boolean_operator)
         self.queries.append(query)
         return self
 
@@ -354,54 +610,47 @@ class Query:
         boolean_operator: Optional[Opt] = None,
     ) -> "Query":
         """
-        Add a query to the query string.
+        Add a new query condition to the query string.
 
         Args:
-            field (SubCategory): The field to query (from SubCategory Enum).
-            value (Union[str, DateRange, CATEGORY]): The value to search for.
-                - For SUBMITTED_DATE: Use DateRange object
-                - For CATEGORY: Use CATEGORY enum
-                - For others: Use string
-            boolean_operator (Optional[BooleanOperator]): Boolean operator to combine queries. Required for second and subsequent queries.
+            field (Field): The field of the arXiv entry to query.
+            value (Union[str, DateRange, Category]): The value to search for. For:
+                - submitted_date: a DateRange instance must be provided.
+                - category: a Category enum or matching string must be provided.
+                - Other fields: a string is expected.
+            boolean_operator (Optional[Opt]): The Boolean operator to combine with existing queries;
+                                              required if adding subsequent conditions.
 
         Returns:
-            Builder: The QueryStringBuilder instance for method chaining.
+            Query: Self for method chaining.
 
         Raises:
-            ValueError: If field or value types are invalid.
-            ValueError: If submitted date format is invalid.
-            ValueError: If boolean operator is missing for subsequent queries.
+            ValueError: If the provided field or value type is invalid.
         """
         if not isinstance(field, Field):
-            raise ValueError(f"Field must be a SubCategory enum, got {type(field)}")
+            raise ValueError(f"Field must be a Field enum, got {type(field)}")
 
         formatted_value = self._format_query_value(field, value)
-
         query = f"{field.value}:{formatted_value}"
-        if len(self.queries) > 0:
-            if boolean_operator is None:
-                raise ValueError("Boolean operator is required when adding multiple queries")
-            if not isinstance(boolean_operator, Opt):
-                raise ValueError(f"Boolean operator must be a BooleanOperator enum, got {type(boolean_operator)}")
-            query = f"{boolean_operator.value} {query}"
-
+        query = self._prepend_boolean_operator(query, boolean_operator)
         self.queries.append(query)
         return self
 
     def _format_query_value(self, field: Field, value: Union[str, DateRange, Category]) -> str:
-        """Format the query value based on field type.
+        """
+        Format the value for a query condition based on the field type.
 
         Args:
-            field (SubCategory): The query field
-            value (Union[str, DateRange, CATEGORY]): The value to format
+            field (Field): The field to query.
+            value (Union[str, DateRange, Category]): The value to format.
 
         Returns:
-            str: Formatted query value
+            str: The formatted value as a string suitable for the arXiv API query.
 
         Raises:
-            ValueError: If value type is invalid for the field
+            ValueError: If the value type is invalid for the specified field.
         """
-        if field == Field.sumbitted_date:
+        if field == Field.submitted_date:
             if isinstance(value, DateRange):
                 return str(value)
             raise ValueError(f"Submitted date must be a DateRange object, got {type(value)}")
@@ -416,87 +665,147 @@ class Query:
 
         raise ValueError(f"Invalid value type for field {field.value}: {type(value)}")
 
-    @staticmethod
-    def _validate_category(value: Union[str, Category]) -> str:
-        """
-        Validate that the category is one of the predefined CATEGORY enum values.
-
-        Args:
-            value: The category value to validate.
-
-        Returns:
-            str: The validated category string.
-
-        Raises:
-            InvalidCategoryError: If the category is not in CATEGORY.
-        """
-        if isinstance(value, Category):
-            return value.value
-        elif isinstance(value, str) and value in {cat.value for cat in Category}:
-            return value
-        else:
-            raise InvalidCategoryError(f"Invalid category: '{value}'. Use a valid CATEGORY enum value from CATEGORY.")
-
     def search_query(self) -> str:
         """
-        Build the query string.
+        Build and return the complete query string from all added conditions.
 
         Returns:
-            str: A single query string for use with the arXiv API.
+            str: The full query string formatted for the arXiv API.
         """
         return " ".join(self.queries)
 
-    def get_page(self, page: int = 1, search_query: str = None) -> FeedResults:
-        search_query = search_query if search_query is not None else self.search_query()
+    def get(self, page: int = 1, search_query: Optional[str] = None) -> Optional[FeedResults]:
+        """
+        Execute the query and retrieve a page of results from the arXiv API.
+
+        Args:
+            page (int): The page number to retrieve (starting from 1).
+            search_query (Optional[str]): A custom search query string; if not provided, the built query string is used.
+
+        Returns:
+            FeedResults: An object containing the parsed results and pagination information.
+        """
+        # Use the default search query if none is provided.
+        if search_query is None:
+            search_query = self.search_query()
+        else:
+            return None
+
+        # Calculate the starting index for the results.
         start = (page - 1) * self.max_results
+
         return Query.http_get(
-            search_query=search_query, start=start, max_results=self.max_results, sortBy=self.sortBy, sortOrder=self.sortOrder, base_url=self.base_url
+            base_url=self.base_url, search_query=search_query, max_results=self.max_results, sortBy=self.sortBy, sortOrder=self.sortOrder, start=start
         )
 
-    @staticmethod
-    def from_feed_entry(entry: feedparser.FeedParserDict) -> Result:
+    def api_url(self):
+        return Query._build_arxiv_url(self.base_url, self.search_query(), self.max_results, self.sortBy, self.sortOrder, 0)
+
+    def paginated_results(self, max_pages: Optional[int] = None) -> Generator[FeedResults, None, None]:
         """
-        Converts a feedparser entry for an arXiv search result feed into a
-        Result object.
+        Generator function that yields paginated results from an arXiv Query object.
+
+        This function calls the query's get() method repeatedly to obtain batches of results.
+        It will yield a FeedResults object for each page until no more results are available or
+        the specified maximum number of pages is reached.
+
+        Args:
+            max_pages (Optional[int]): The maximum number of pages to process. If None, process all pages.
+
+        Yields:
+            FeedResults: The results for each page.
         """
-        if not hasattr(entry, "id"):
-            raise Result.MissingFieldError("id")
-        # Title attribute may be absent for certain titles. Defaulting to "0" as
-        # it's the only title observed to cause this bug.
-        # https://github.com/lukasschwab/arxiv.py/issues/71
-        # title = entry.title if hasattr(entry, "title") else "0"
-        title = "0"
-        if hasattr(entry, "title"):
-            title = entry.title
-        else:
-            logger.warning("Result %s is missing title attribute; defaulting to '0'", entry.id)
-        return Result(
-            entry_id=entry.id,
-            updated=Result._to_datetime(entry.updated_parsed),
-            published=Result._to_datetime(entry.published_parsed),
-            title=re.sub(r"\s+", " ", title),
-            authors=[Result.Author._from_feed_author(a) for a in entry.authors],
-            summary=entry.summary,
-            comment=entry.get("arxiv_comment"),
-            journal_ref=entry.get("arxiv_journal_ref"),
-            doi=entry.get("arxiv_doi"),
-            primary_category=entry.arxiv_primary_category.get("term"),
-            categories=[tag.get("term") for tag in entry.tags],
-            links=[Result.Link._from_feed_link(link) for link in entry.links],
-            _raw=entry,
-        )
+        page = 1
+        while True:
+            retry_attempt = 0
+            results = None
+            while retry_attempt < 10:
+                results = self.get(page=page)
+                # If results is None or contains no entries, retry
+                if results is None or not results.entrys:
+                    retry_attempt += 1
+                    time.sleep(3)
+                    continue
+                # If not on the last page but the number of entries is less than self.max_results, retry
+                if results.startIndex + results.maxEntryPerPage < results.total_entries_of_query and len(results.entrys) < self.max_results:
+                    retry_attempt += 1
+                    time.sleep(3)
+                    continue
+                # Otherwise, accept the results
+                break
+            if retry_attempt >= 10:
+                raise Exception(f"Failed to fetch page {page} from arXiv API after 10 attempts.")
+
+            yield results
+
+            if max_pages is not None and page >= max_pages:
+                break
+
+            if results.startIndex + results.maxEntryPerPage >= results.total_entries_of_query:
+                break
+
+            page += 1
+            time.sleep(1.5)
 
     @staticmethod
     def http_get(
-        base_url: str = "http://export.arxiv.org/api/query?",
-        search_query: str = "",
+        base_url: str,
+        search_query: str,
         max_results: int = 5,
-        sortBy: SortOrder = SortCriterion.SubmittedDate,
+        sortBy: SortCriterion = SortCriterion.SubmittedDate,
         sortOrder: SortOrder = SortOrder.Descending,
         start: int = 0,
     ) -> FeedResults:
+        """
+        Perform an HTTP GET request to the arXiv API and parse the response.
 
-        # Construct the parameters dictionary. Note that the search_query value contains quotes.
+        Args:
+            base_url (str): The base URL for the arXiv API.
+            search_query (str): The query string to be sent.
+            max_results (int): Maximum number of results to retrieve.
+            sortBy (SortCriterion): The field to sort results by.
+            sortOrder (SortOrder): The order in which to sort the results.
+            start (int): The starting index for the results (0-based).
+
+        Returns:
+            FeedResults: An object containing the parsed feed results and pagination information.
+
+        Raises:
+            http.client.RemoteDisconnected: If the remote end closes the connection without response.
+        """
+        url = Query._build_arxiv_url(base_url, search_query, max_results, sortBy, sortOrder, start)
+        logger.debug(f"Arxiv API Request URL: {url}")
+
+        try:
+            response = urllib.request.urlopen(url).read()
+        except http.client.RemoteDisconnected as e:
+            logger.error(f"Remote end closed connection without response for URL: {url}")
+            raise e
+        return Query._parse_feed_response(response)
+
+    @staticmethod
+    def _build_arxiv_url(
+        base_url: str,
+        search_query: str,
+        max_results: int,
+        sortBy: SortCriterion,
+        sortOrder: SortOrder,
+        start: int,
+    ) -> str:
+        """
+        Construct the full URL for an arXiv API query.
+
+        Args:
+            base_url (str): The base URL for the API.
+            search_query (str): The search query string.
+            max_results (int): Maximum number of results to return.
+            sortBy (SortCriterion): The field to sort by.
+            sortOrder (SortOrder): The order in which to sort the results.
+            start (int): The starting index for results (0-based).
+
+        Returns:
+            str: The complete URL with encoded query parameters.
+        """
         params = {
             "search_query": search_query,
             "max_results": max_results,
@@ -504,26 +813,47 @@ class Query:
             "sortOrder": sortOrder.value,
             "start": start,
         }
-
-        # Use urllib.parse.urlencode to encode the parameters properly.
         query_string = urllib.parse.urlencode(params)
-        url = base_url + query_string
+        return base_url + query_string
 
-        logger.debug(f"Arxiv API Request URL:{url}")  # Debug: print the constructed URL
+    @staticmethod
+    def _parse_feed_response(response: bytes) -> FeedResults:
+        """
+        Parse the raw response from the arXiv API using feedparser.
 
-        # Perform a GET request using the properly constructed URL.
-        response = urllib.request.urlopen(url).read()
+        Args:
+            response (bytes): The raw API response in bytes.
 
-        # Parse the response using feedparser.
+        Returns:
+            FeedResults: An object containing the list of results and pagination data.
+        """
         feed = feedparser.parse(response)
-        total_results = int(getattr(feed.feed, "opensearch_totalresults", -1))
+
+        total_results_of_query = int(getattr(feed.feed, "opensearch_totalresults", -1))
         start_index = int(getattr(feed.feed, "opensearch_startindex", -1))
         items_per_page = int(getattr(feed.feed, "opensearch_itemsperpage", -1))
 
-        # Process and print each entry from the feed.
-        results: List[Result] = []
-        for entry in feed.entries:
-            result = Query.from_feed_entry(entry)
-            results.append(result)
+        entries: List[Result] = [Result._from_feed_entry(entry) for entry in feed.entries]
 
-        return FeedResults(results, total_results, start_index, items_per_page)
+        return FeedResults(entries, total_results_of_query, start_index, items_per_page)
+
+    @staticmethod
+    def _validate_category(value: Union[str, Category]) -> str:
+        """
+        Validate that the given category is valid.
+
+        Args:
+            value (Union[str, Category]): The category value to validate.
+
+        Returns:
+            str: The validated category string.
+
+        Raises:
+            InvalidCategoryError: If the category is not a valid Category enum member or string.
+        """
+        if isinstance(value, Category):
+            return value.value
+        elif isinstance(value, str) and value in {cat.value for cat in Category}:
+            return value
+        else:
+            raise InvalidCategoryError(f"Invalid category: '{value}'. Use a valid CATEGORY enum value from CATEGORY.")

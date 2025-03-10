@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "arxiv_query_fluent"
 version = "0.0.1"
 authors = [
-  {name="Michael Lee", email="micahel@ifugood.com"},
+  {name="Michael Lee", email="michael@ifugood.com"},
 ]
 description = "A Python library providing a fluent, intuitive, and chainable interface for easily building complex arXiv API queries, simplifying data retrieval and integration into your workflow."
 readme = "README.md"
@@ -27,4 +27,4 @@ Homepage = "https://github.com/maikeruSan/arxiv_query_fluent"
 Repository = "https://github.com/maikeruSan/arxiv_query_fluent"
 
 [tool.setuptools.packages.find]
-where = ["src"]  # 從 src 資料夾尋找套件
+where = ["src"]  #
